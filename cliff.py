@@ -404,18 +404,20 @@ def _greedy_trajectory(env, Q, max_steps=200):
 def sarsa_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
                     n_episodes=500, snapshot_eps=None, seed=0):
     """
-    SARSA with greedy-policy and trajectory snapshots.
+    SARSA with policy and trajectory snapshots.
 
     At each episode in *snapshot_eps*, records:
       • the current greedy policy  (argmax Q)
-      • one greedy trajectory from the start state
+      • the actual epsilon-greedy trajectory of that training episode
+        (capped at 300 steps for display; shows real agent behaviour including
+        cliff falls, not a post-hoc greedy rollout)
 
     Returns
     -------
     Q               : final action-value function
     episode_rewards : per-episode total rewards
     pi_snapshots    : {ep: greedy policy array}
-    traj_snapshots  : {ep: list of states visited greedily}
+    traj_snapshots  : {ep: list of states from the actual training episode}
     """
     snap_set = set(snapshot_eps) if snapshot_eps is not None else set()
     rng = np.random.default_rng(seed)
@@ -429,6 +431,8 @@ def sarsa_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
         s_idx  = env.state_index(state)
         action = _epsilon_greedy(Q[s_idx], epsilon, env.n_actions, rng)
         total_reward = 0.0
+        recording = ep in snap_set
+        ep_traj = [state] if recording else None
 
         while not env.is_terminal(state):
             next_state, reward, _ = env.step(state, action)
@@ -439,11 +443,13 @@ def sarsa_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
             )
             total_reward += reward
             state, s_idx, action = next_state, ns_idx, next_action
+            if recording and len(ep_traj) < 300:
+                ep_traj.append(state)
 
         episode_rewards.append(total_reward)
         if ep in snap_set:
             pi_snapshots[ep]   = np.argmax(Q, axis=1).copy()
-            traj_snapshots[ep] = _greedy_trajectory(env, Q)
+            traj_snapshots[ep] = ep_traj
 
     return Q, episode_rewards, pi_snapshots, traj_snapshots
 
@@ -451,14 +457,19 @@ def sarsa_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
 def q_learning_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
                           n_episodes=500, snapshot_eps=None, seed=0):
     """
-    Q-learning with greedy-policy and trajectory snapshots.
+    Q-learning with policy and trajectory snapshots.
+
+    At each episode in *snapshot_eps*, records:
+      • the current greedy policy  (argmax Q)
+      • the actual epsilon-greedy trajectory of that training episode
+        (capped at 300 steps for display)
 
     Returns
     -------
     Q               : final action-value function
     episode_rewards : per-episode total rewards
     pi_snapshots    : {ep: greedy policy array}
-    traj_snapshots  : {ep: list of states visited greedily}
+    traj_snapshots  : {ep: list of states from the actual training episode}
     """
     snap_set = set(snapshot_eps) if snapshot_eps is not None else set()
     rng = np.random.default_rng(seed)
@@ -470,6 +481,8 @@ def q_learning_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
     for ep in range(1, n_episodes + 1):
         state = env.START
         total_reward = 0.0
+        recording = ep in snap_set
+        ep_traj = [state] if recording else None
 
         while not env.is_terminal(state):
             s_idx  = env.state_index(state)
@@ -481,11 +494,13 @@ def q_learning_snapshots(env, gamma=1.0, alpha=0.5, epsilon=0.1,
             )
             total_reward += reward
             state = next_state
+            if recording and len(ep_traj) < 300:
+                ep_traj.append(state)
 
         episode_rewards.append(total_reward)
         if ep in snap_set:
             pi_snapshots[ep]   = np.argmax(Q, axis=1).copy()
-            traj_snapshots[ep] = _greedy_trajectory(env, Q)
+            traj_snapshots[ep] = ep_traj
 
     return Q, episode_rewards, pi_snapshots, traj_snapshots
 
@@ -667,6 +682,150 @@ def actor_critic(env, gamma=1.0, alpha_theta=0.01, alpha_w=0.1,
         episode_rewards.append(total_reward)
 
     return theta, w, episode_rewards
+
+
+def reinforce_snapshots(env, gamma=1.0, alpha=0.005, n_episodes=5000,
+                        max_steps=500, snapshot_eps=None, seed=0):
+    """
+    REINFORCE with greedy-policy snapshots.
+
+    At each episode in *snapshot_eps*, records argmax_a θ[s, a] for all s.
+
+    Returns (theta, episode_rewards, pi_snapshots).
+    """
+    snap_set = set(snapshot_eps) if snapshot_eps is not None else set()
+    rng = np.random.default_rng(seed)
+    theta = np.zeros((env.n_states, env.n_actions))
+    episode_rewards = []
+    pi_snapshots = {}
+
+    for ep in range(1, n_episodes + 1):
+        trajectory = []
+        state = env.START
+        total_reward = 0.0
+        steps = 0
+
+        while not env.is_terminal(state) and steps < max_steps:
+            s_idx  = env.state_index(state)
+            probs  = _softmax(theta[s_idx])
+            action = int(rng.choice(env.n_actions, p=probs))
+            next_state, reward, _ = env.step(state, action)
+            trajectory.append((s_idx, action, reward))
+            total_reward += reward
+            state  = next_state
+            steps += 1
+
+        episode_rewards.append(total_reward)
+
+        G = 0.0
+        for t in reversed(range(len(trajectory))):
+            s_idx, action, reward = trajectory[t]
+            G = reward + gamma * G
+            probs = _softmax(theta[s_idx])
+            grad  = -probs.copy()
+            grad[action] += 1.0
+            theta[s_idx] += alpha * (gamma ** t) * G * grad
+
+        if ep in snap_set:
+            pi_snapshots[ep] = np.argmax(theta, axis=1).copy()
+
+    return theta, episode_rewards, pi_snapshots
+
+
+def reinforce_baseline_snapshots(env, gamma=1.0, alpha_theta=0.005, alpha_w=0.1,
+                                  n_episodes=5000, max_steps=500,
+                                  snapshot_eps=None, seed=0):
+    """
+    REINFORCE with baseline — greedy-policy snapshots.
+
+    Returns (theta, w, episode_rewards, pi_snapshots).
+    """
+    snap_set = set(snapshot_eps) if snapshot_eps is not None else set()
+    rng = np.random.default_rng(seed)
+    theta = np.zeros((env.n_states, env.n_actions))
+    w     = np.zeros(env.n_states)
+    episode_rewards = []
+    pi_snapshots = {}
+
+    for ep in range(1, n_episodes + 1):
+        trajectory = []
+        state = env.START
+        total_reward = 0.0
+        steps = 0
+
+        while not env.is_terminal(state) and steps < max_steps:
+            s_idx  = env.state_index(state)
+            probs  = _softmax(theta[s_idx])
+            action = int(rng.choice(env.n_actions, p=probs))
+            next_state, reward, _ = env.step(state, action)
+            trajectory.append((s_idx, action, reward))
+            total_reward += reward
+            state  = next_state
+            steps += 1
+
+        episode_rewards.append(total_reward)
+
+        G = 0.0
+        for t in reversed(range(len(trajectory))):
+            s_idx, action, reward = trajectory[t]
+            G     = reward + gamma * G
+            delta = G - w[s_idx]
+            w[s_idx] += alpha_w * delta
+            probs = _softmax(theta[s_idx])
+            grad  = -probs.copy()
+            grad[action] += 1.0
+            theta[s_idx] += alpha_theta * (gamma ** t) * delta * grad
+
+        if ep in snap_set:
+            pi_snapshots[ep] = np.argmax(theta, axis=1).copy()
+
+    return theta, w, episode_rewards, pi_snapshots
+
+
+def actor_critic_snapshots(env, gamma=1.0, alpha_theta=0.005, alpha_w=0.1,
+                            n_episodes=5000, max_steps=500,
+                            snapshot_eps=None, seed=0):
+    """
+    One-step Actor-Critic — greedy-policy snapshots.
+
+    Returns (theta, w, episode_rewards, pi_snapshots).
+    """
+    snap_set = set(snapshot_eps) if snapshot_eps is not None else set()
+    rng = np.random.default_rng(seed)
+    theta = np.zeros((env.n_states, env.n_actions))
+    w     = np.zeros(env.n_states)
+    episode_rewards = []
+    pi_snapshots = {}
+
+    for ep in range(1, n_episodes + 1):
+        state = env.START
+        total_reward = 0.0
+        t = 0
+
+        while not env.is_terminal(state) and t < max_steps:
+            s_idx  = env.state_index(state)
+            probs  = _softmax(theta[s_idx])
+            action = int(rng.choice(env.n_actions, p=probs))
+            next_state, reward, _ = env.step(state, action)
+            ns_idx = env.state_index(next_state)
+
+            delta = reward + gamma * w[ns_idx] - w[s_idx]
+            w[s_idx] += alpha_w * delta
+
+            grad = -probs.copy()
+            grad[action] += 1.0
+            theta[s_idx] += alpha_theta * (gamma ** t) * delta * grad
+
+            total_reward += reward
+            state  = next_state
+            t     += 1
+
+        episode_rewards.append(total_reward)
+
+        if ep in snap_set:
+            pi_snapshots[ep] = np.argmax(theta, axis=1).copy()
+
+    return theta, w, episode_rewards, pi_snapshots
 
 
 def theta_to_policy(theta):
